@@ -35,149 +35,6 @@ import (
 	"github.com/wheelcomplex/goqueue/stack"
 )
 
-// HashWatcher use fnv1a hash to map(mod) path to watcher
-// and provide output channel for read events
-type HashWatcher struct {
-	Events   chan fsnotify.Event          // event output channel, read all Stack.Out() and forward here
-	Errors   chan error                   // error output channel
-	watchers map[uint64]*fsnotify.Watcher // working watcher, output channel == Stack.RawIn()
-	size     int                          // number of watcher
-	closed   bool                         // flag
-	exited   chan struct{}                // flag
-	closing  chan struct{}                // notify for forwarder
-	hasher   hash.Hash64                  //
-	hashMu   sync.Mutex                   // lock
-	closeMu  sync.Mutex                   // lock
-}
-
-// NewHashWatcher return HashWatcher with size fsnotify.Watcher
-// size less then 5 will got 5 Watcher
-func NewHashWatcher(size int) (*HashWatcher, error) {
-	if size < 1 {
-		size = 1
-	}
-	self := &HashWatcher{
-		Events:   make(chan fsnotify.Event, 1024*size),
-		Errors:   make(chan error, 1024*size),
-		watchers: make(map[uint64]*fsnotify.Watcher),
-		size:     size,
-		closed:   false,
-		closing:  make(chan struct{}, size),
-		exited:   make(chan struct{}, size),
-		hasher:   fnv.New64a(),
-		hashMu:   sync.Mutex{},
-		closeMu:  sync.Mutex{},
-	}
-	var err error
-	for i := 0; i < size; i++ {
-		self.watchers[uint64(i)], err = fsnotify.NewWatcher(1024)
-		if err != nil {
-			return nil, err
-		}
-		//fmt.Printf("HashWatcher NewWatcher %d/%d\n", size, i)
-		// goroutine to forward events to output
-		go self.evReciver(uint64(i))
-		go self.erReciver(uint64(i))
-	}
-	return self, nil
-}
-
-// Close close all watchers/stacks/channel
-func (self *HashWatcher) Close() {
-	self.closeMu.Lock()
-	defer self.closeMu.Unlock()
-	if self.closed {
-		return
-	}
-	self.closed = true
-	//fmt.Printf("HashWatcher %p closing ...\n", self)
-	// close all watcher so forwarder exit
-	for i, _ := range self.watchers {
-		self.watchers[i].Close()
-	}
-	// waiting for Reciver exist
-	for _ = range self.watchers {
-		<-self.exited //evReciver
-		<-self.exited //erReciver
-	}
-	//
-	//fmt.Printf("HashWatcher %p closed\n", self)
-	return
-}
-
-// evReciver forward event to stack
-func (self *HashWatcher) evReciver(id uint64) {
-	//fmt.Printf("evReciver %d running\n", id)
-	defer func() {
-		//fmt.Printf("evReciver %d closing ...\n", id)
-		self.exited <- struct{}{}
-		//fmt.Printf("evReciver %d closed\n", id)
-	}()
-	for event := range self.watchers[id].Events {
-		self.Events <- event
-	}
-	return
-}
-
-// erReciver forward error to stack
-func (self *HashWatcher) erReciver(id uint64) {
-	//fmt.Printf("erReciver %d running\n", id)
-	defer func() {
-		//fmt.Printf("erReciver %d closing ...\n", id)
-		self.exited <- struct{}{}
-		//fmt.Printf("erReciver %d closed\n", id)
-	}()
-	for err := range self.watchers[id].Errors {
-		self.Errors <- err
-	}
-	return
-}
-
-// IsWatched return true if path already watched
-func (self *HashWatcher) IsWatched(path string) bool {
-	i := self.Sum64a(path) % uint64(self.size)
-	return self.watchers[i].IsWatched(path)
-}
-
-// AddPath map and watch path
-func (self *HashWatcher) Add(path string) error {
-	i := self.Sum64a(path) % uint64(self.size)
-	if self.watchers[i].IsWatched(path) {
-		return nil
-	}
-	err := self.watchers[i].Add(path)
-	//fmt.Printf("AddPath %s to slot %d: %v\n", path, i, err)
-	return err
-}
-
-// RemovePath map and remove path from watcher
-func (self *HashWatcher) Remove(path string) error {
-	i := self.Sum64a(path) % uint64(self.size)
-	err := self.watchers[i].Remove(path)
-	//fmt.Printf("RemovePath %s from slot %d: %v\n", path, i, err)
-	return err
-}
-
-// Sum64a
-func (self *HashWatcher) Sum64a(data string) uint64 {
-	self.hashMu.Lock()
-	defer self.hashMu.Unlock()
-	self.hasher.Reset()
-	self.hasher.Write([]byte(data))
-	return self.hasher.Sum64()
-}
-
-// Count return watched path size
-func (self *HashWatcher) Count() uint64 {
-	var pathNum uint64
-	for i, _ := range self.watchers {
-		pathNum = pathNum + uint64(self.watchers[i].Count())
-	}
-	return pathNum
-}
-
-/////////////////////////////////////
-
 const (
 	// IgnoreThresholdRange is the amount of time in ns to ignore when
 	// receiving watch events for the same file+same event
@@ -239,17 +96,17 @@ func newCacheInfo() *cacheInfo {
 // PathWatcher is a wrapper around which adds some additional features:
 //
 // output channel will closed after *PathWatcher.Close()
+// NOTE: when events > 100000/s, a few event may lost and do not handled
 type PathWatcher struct {
 	events        *stack.Stack              // output stack
 	eventsIn      chan<- interface{}        // In() of output stack
-	pWatcher      *HashWatcher              // group of watcher
-	rWatcher      *HashWatcher              // group of watcher
+	pWatcher      *fsnotify.Watcher         // group of watcher
+	rWatcher      *fsnotify.Watcher         // group of watcher
 	cache         map[uint64]*cacheInfo     // event cache, index by FileInfo.Inode
 	cacheMu       *sync.Mutex               // lock
 	watcherNum    int                       // output channel buffer size
 	isClosed      bool                      // is watcher is working
 	closing       chan struct{}             // tell eventProc to closing
-	exited        chan struct{}             // eventProc exited
 	threshold     int64                     // Throughput Limitations
 	maxCacheIdle  time.Duration             //
 	watchIncRegex map[string]*regexp.Regexp // compiled watchInclude filter
@@ -262,8 +119,7 @@ type PathWatcher struct {
 	removeWatch   chan<- interface{}        // remove watch deleted dir
 	removeStack   *stack.Stack              // remove watch queue
 	hasher        hash.Hash64               // string to uint hasher
-	goCount       int                       // goroutine counter
-	rootList      map[string]struct{}       // root dir
+	wg            sync.WaitGroup            // goroutine sync
 }
 
 // NewPathWatcher creates an instance of PathWatcher.
@@ -279,13 +135,11 @@ func NewPathWatcher(size int) *PathWatcher {
 		watchExcRegex: make(map[string]*regexp.Regexp),
 		scanDone:      make(chan error, 1),
 		isClosed:      true,
-		closing:       make(chan struct{}, 8),
-		exited:        make(chan struct{}, 8),
 		cacheMu:       &sync.Mutex{},
 		scanMu:        &sync.Mutex{},
 		miscMutex:     &sync.Mutex{},
 		hasher:        fnv.New64a(),
-		goCount:       0,
+		wg:            sync.WaitGroup{},
 	}
 	return self
 }
@@ -315,15 +169,15 @@ func (self *PathWatcher) newWatchHandle() error {
 		// no closed, do not need re-initial
 		return nil
 	}
-	self.rootList = make(map[string]struct{})
 	//
 	self.isClosed = false
+	self.closing = make(chan struct{}, 128)
 	self.cache = make(map[uint64]*cacheInfo)
-	self.pWatcher, err = NewHashWatcher(self.watcherNum)
+	self.pWatcher, err = fsnotify.NewWatcher(self.watcherNum * 4096)
 	if err != nil {
 		return err
 	}
-	self.rWatcher, err = NewHashWatcher(self.watcherNum)
+	self.rWatcher, err = fsnotify.NewWatcher(self.watcherNum * 4096)
 	if err != nil {
 		return err
 	}
@@ -333,37 +187,21 @@ func (self *PathWatcher) newWatchHandle() error {
 	self.lazyAddCh = self.addStack.In()
 	self.removeStack = stack.NewStack(256, -1, false)
 	self.removeWatch = self.removeStack.In()
-
 	self.scanDone = make(chan error, 8)
 	//
-	self.goCount = 0
-	//
 	go self.cacheMgr()
-	self.goCount++
 	//
-	go self.watchMgr(1)
-	self.goCount++
-	//go self.watchMgr(2)
-	//self.goCount++
-	//go self.watchMgr(3)
-	//self.goCount++
-	//go self.watchMgr(3)
-	//self.goCount++
+	go self.watchMgr()
 	//
-	go self.eventProc(false)
-	go self.eventProc(false)
+	go self.pEventProc()
+	go self.pEventProc()
 	//
-	go self.eventProc(true)
-	go self.eventProc(true)
-	go self.eventProc(true)
-	go self.eventProc(true)
-	go self.eventProc(true)
-	go self.eventProc(true)
+	go self.rEventProc()
+	go self.rEventProc()
+	go self.rEventProc()
 	//
 	go self.errorRead(false)
-	self.goCount++
 	go self.errorRead(true)
-	self.goCount++
 	//
 	return nil
 }
@@ -392,16 +230,8 @@ func (self *PathWatcher) Close() error {
 	self.pWatcher.Close()
 	self.rWatcher.Close()
 	//
-	// eventProc + cacheMgr + watchMgr
-	for i := 0; i < self.goCount; i++ {
-		self.closing <- struct{}{}
-		//println("self.closing <-")
-	}
-	// waiting for event handle + cacheMgr + watchMgr exit
-	for i := 0; i < self.goCount; i++ {
-		<-self.exited
-		//println("<-self.exited")
-	}
+	close(self.closing)
+	self.wg.Wait()
 	//
 	// close stack
 	self.addStack.Close()
@@ -411,15 +241,20 @@ func (self *PathWatcher) Close() error {
 	//
 	self.cache = nil
 	//
+	close(self.lazyAddCh)
+	close(self.removeWatch)
+	//
 	fmt.Printf("PathWatcher %p closed\n", self)
 	return nil
 }
 
 // errorRead running in goroutine and forward error event to output
 func (self *PathWatcher) errorRead(recursive bool) {
+	self.wg.Add(1)
+	defer self.wg.Done()
 	//fmt.Printf("errorRead(%v) running ...\n", recursive)
 	var everror error
-	var watcher *HashWatcher
+	var watcher *fsnotify.Watcher
 	if recursive {
 		watcher = self.rWatcher
 	} else {
@@ -429,9 +264,6 @@ func (self *PathWatcher) errorRead(recursive bool) {
 	for {
 		select {
 		case <-self.closing:
-			//fmt.Printf("errorRead(%v) closing ...\n", recursive)
-			self.exited <- struct{}{}
-			//fmt.Printf("errorRead(%v) closed.\n", recursive)
 			return
 		case everror = <-watcher.Errors:
 			self.eventSend(newActEvent(STAGE_WATCH, 0, DUMMY_EVENT, 0, 0, false, everror), nil)
@@ -440,29 +272,23 @@ func (self *PathWatcher) errorRead(recursive bool) {
 	return
 }
 
-// eventProc running in goroutine and forward event to output
-func (self *PathWatcher) eventProc(recursive bool) {
-	//fmt.Printf("eventProc(%v) running ...\n", recursive)
+// pEventProc running in goroutine and forward event to output
+func (self *PathWatcher) pEventProc() {
+	self.wg.Add(1)
+	defer self.wg.Done()
+	//fmt.Printf("pEventProc(%v) running ...\n", recursive)
 	var evInterface interface{}
 	var event fsnotify.Event
-	tk := time.NewTicker(5e9) // second tick
-	defer tk.Stop()
-	var watcher *HashWatcher
-	if recursive {
-		watcher = self.rWatcher
-	} else {
-		watcher = self.pWatcher
-	}
 	//
-	for evInterface = range watcher.Events {
+	for evInterface = range self.pWatcher.Events {
 		event = evInterface.(fsnotify.Event)
 		//
 		//evcnt++
 		//
 		hid := self.Sum64a(event.Name)
+		//fmt.Printf("%d, pEventProc(%v) event %+v\n", hid, recursive, event)
 		// you can not stat a delete file...
 		if event.IsDelete() {
-			self.removeWatch <- &idPath{id: hid, path: event.Name}
 			//fmt.Printf("%d, removeWatch(%v) event %+v\n", hid, recursive, event)
 			// adjust with arbitrary value because it was deleted
 			// before it got here
@@ -471,10 +297,61 @@ func (self *PathWatcher) eventProc(recursive bool) {
 		}
 		if self.watchMatch(event.Name) == false {
 			// TODO: test match
-			fmt.Printf("IgnorePath eventProc(%v) event %+v\n", recursive, event)
+			fmt.Printf("IgnorePath pEventProc event %+v\n", event)
 			continue
 		}
-		//fmt.Printf("%d, eventProc(%v) event %+v\n", hid, recursive, event)
+		//fmt.Printf("%d, pEventProc(%v) event %+v\n", hid, recursive, event)
+		fi, err := os.Lstat(event.Name)
+		//rename send two events,one old file,one new file,here ignore old one
+		if os.IsNotExist(err) {
+			continue
+		}
+		//if err != nil {
+		//      // too many levels of symbolic links/fi=<nil>
+		//      fmt.Printf("path exist but error: err=%v/fi=%v/event=%v\n", err, fi, event)
+		//}
+		if fi == nil {
+			self.eventSend(newActEvent(STAGE_WATCH, hid, event, time.Now().UnixNano()-10, 0, false, nil), nil)
+			continue
+		}
+		self.eventSend(newActEvent(STAGE_WATCH, hid, event, fi.ModTime().UnixNano(), fi.Sys().(*syscall.Stat_t).Ino, fi.IsDir(), nil), fi)
+		//
+		///////////////////////////
+	}
+	return
+}
+
+// rEventProc running in goroutine and forward event to output
+func (self *PathWatcher) rEventProc() {
+	self.wg.Add(1)
+	defer self.wg.Done()
+	//fmt.Printf("rEventProc(%v) running ...\n", recursive)
+	var evInterface interface{}
+	var event fsnotify.Event
+	//
+	for evInterface = range self.rWatcher.Events {
+		event = evInterface.(fsnotify.Event)
+		//
+		//evcnt++
+		//
+		hid := self.Sum64a(event.Name)
+		//fmt.Printf("%d, rEventProc(%v) event %+v\n", hid, recursive, event)
+		// you can not stat a delete file...
+		if event.IsDelete() {
+			self.rWatcher.Purge(event.Name)
+			//self.removeWatch <- &idPath{id: hid, path: event.Name}
+			//fmt.Printf("%d, removeWatch(%v) event %+v\n", hid, recursive, event)
+			// adjust with arbitrary value because it was deleted
+			// before it got here
+			self.eventSend(newActEvent(STAGE_WATCH, hid, event, time.Now().UnixNano()-10, 0, false, nil), nil)
+			continue
+		}
+		if self.watchMatch(event.Name) == false {
+			// TODO: test match
+			fmt.Printf("IgnorePath rEventProc event %+v\n", event)
+			continue
+		}
+		//fmt.Printf("%d, rEventProc(%v) event %+v\n", hid, recursive, event)
 		fi, err := os.Lstat(event.Name)
 		//rename send two events,one old file,one new file,here ignore old one
 		if os.IsNotExist(err) {
@@ -498,66 +375,82 @@ func (self *PathWatcher) eventProc(recursive bool) {
 			continue
 		}
 		//
-		if recursive && isDir && event.IsCreate() {
+		if isDir && event.IsCreate() {
 			// first watch, direct watch, no recursive
-			// self.rWatcher
-			err = watcher.Add(event.Name)
-			if err != nil {
-				self.eventSend(newActEvent(STAGE_WATCH, hid, event, fi.ModTime().UnixNano(), fi.Sys().(*syscall.Stat_t).Ino, isDir, err), fi)
-			}
+			self.rWatcher.Add(event.Name)
 			// recursive scan
 			self.lazyAddCh <- &idPath{id: hid, path: event.Name}
 		} else {
-			//fmt.Printf("%d, eventProc(%v), isDir %v, IsCreate %v, event %+v\n", hid, recursive, isDir, event.IsCreate(), event)
+			//fmt.Printf("%d, rEventProc(%v), isDir %v, IsCreate %v, event %+v\n", hid, recursive, isDir, event.IsCreate(), event)
 		}
 		///////////////////////////
 	}
-	//fmt.Printf("eventProc(%v) closing ...\n", recursive)
-	self.exited <- struct{}{}
-	//fmt.Printf("eventProc(%v) closed.\n", recursive)
 	return
 }
 
 //
-func (self *PathWatcher) watchMgr(id int) {
+func (self *PathWatcher) lazyWatch(path string) int64 {
+	//
+	var addCount int64
+	dirs, _, _ := fc.ScanDir(path, fc.FOLDER_SCAN_DIR_ONLY, false)
+	// dirs will not include path
+	for key, _ := range dirs {
+		// add to rWatcher
+		if self.rWatcher.IsWatched(key) {
+			continue
+		}
+		addCount++
+		err := self.rWatcher.Add(key)
+		self.eventSend(&ActEvent{
+			Stage:    STAGE_LAZY,
+			Event:    fsnotify.NewEvent(fsnotify.Create|fsnotify.Write, key),
+			IsFolder: true,
+			UnixNano: dirs[key].ModTime().UnixNano(),
+			Inode:    dirs[key].Sys().(*syscall.Stat_t).Ino,
+			Err:      err,
+			Id:       self.Sum64a(key),
+		}, dirs[key])
+	}
+	return addCount
+}
+
+//
+func (self *PathWatcher) watchMgr() {
 	// signle thread, do not need lock
-	addCh := self.addStack.Out()
-	removeCh := self.removeStack.Out()
-	tk := time.NewTicker(5e8) // 500ms
+	self.wg.Add(1)
+	defer self.wg.Done()
+	tk := time.NewTicker(5e8)
 	defer tk.Stop()
 	lazyList := make(map[string]struct{})
-	//var preMiss int64 = -1
+	lazyOut := self.addStack.Out()
+	removeOut := self.removeStack.Out()
 	for {
 		select {
 		case <-tk.C:
-			if self.addStack.GetCacheSize() == 0 && len(self.cache) < 256 && len(lazyList) > 0 {
-				//fmt.Printf("watchMgr#%d, lazy watch %d paths.\n", id, len(lazyList))
+			if self.addStack.GetCacheSize() == 0 && len(lazyList) > 0 {
+				//fmt.Printf("watchMgr, lazy watch %d paths.\n", len(lazyList))
 				for lazyPath, _ := range lazyList {
-					//fmt.Printf("watchMgr, recursive watch lazyPath %v\n", lazyPath)
-					self.lazyWatch(lazyPath)
+					go self.lazyWatch(lazyPath)
+					//if nw := self.lazyWatch(lazyPath); nw > 0 {
+					//	fmt.Printf("watchMgr, new watch %v\n", nw)
+					//}
 					delete(lazyList, lazyPath)
+					if self.addStack.GetCacheSize() > 0 {
+						break
+					}
 				}
+				//fmt.Printf("watchMgr, lazy watch %d end.\n", len(lazyList))
 			}
-		case addInfo := <-addCh:
-			// have to re-scan parent dir for missed events
-			lazyList[filepath.Dir(addInfo.(*idPath).path)] = struct{}{}
+		case addInfo := <-lazyOut:
 			//
 			lazyList[addInfo.(*idPath).path] = struct{}{}
 			//
-		case removeInfo := <-removeCh:
+		//case <-self.addStack.Out():
+		case removeInfo := <-removeOut:
 			// BUG: inotify_rm_watch: invalid argument
-			go func() {
-				if self.pWatcher.IsWatched(removeInfo.(*idPath).path) {
-					self.pWatcher.Remove(removeInfo.(*idPath).path)
-				}
-				if self.rWatcher.IsWatched(removeInfo.(*idPath).path) {
-					self.rWatcher.Remove(removeInfo.(*idPath).path)
-				}
-			}()
+			//rmlist[removeInfo.(*idPath).path] = struct{}{}
+			self.rWatcher.Purge(removeInfo.(*idPath).path)
 		case <-self.closing:
-			close(self.lazyAddCh)
-			close(self.removeWatch)
-			self.exited <- struct{}{}
 			return
 		}
 	}
@@ -576,7 +469,7 @@ func (self *PathWatcher) eventSend(ae *ActEvent, fi os.FileInfo) {
 	// compare the current stats of a file against its last stats
 	// (if any) and if it falls within a nanoseconds threshold,
 	// ignore it.
-	if self.threshold > 0 {
+	if self.threshold > 0 && ae.Event.IsDelete() == false {
 		self.cacheMu.Lock()
 		defer self.cacheMu.Unlock()
 		evTag := ae.Event.OpVar() // filename+event
@@ -603,7 +496,7 @@ func (self *PathWatcher) eventSend(ae *ActEvent, fi os.FileInfo) {
 		self.cache[ae.Id].list[evTag] = &fi
 	}
 	self.eventsIn <- ae
-	if ae.Stage == STAGE_LAZY {
+	if ae.Stage == STAGE_LAZY && ae.Event.IsCreate() {
 		// recursive scan lazy path
 		self.lazyAddCh <- &idPath{id: ae.Id, path: ae.Event.Name}
 	}
@@ -618,81 +511,34 @@ type idPath struct {
 
 //
 func (self *PathWatcher) cacheMgr() {
-	tk := time.NewTicker(3e9)
+	self.wg.Add(1)
+	tk := time.NewTicker(1e9)
 	defer func() {
 		tk.Stop()
-		//fmt.Printf("cacheMgr closing ...\n")
-		self.exited <- struct{}{}
-		//fmt.Printf("cacheMgr closed.\n")
+		self.wg.Done()
 	}()
 	for {
 		select {
 		case <-self.closing:
 			return
 		case ts := <-tk.C:
-			for name, _ := range self.cache {
-				self.cacheMu.Lock()
-				if ts.Sub(self.cache[name].last) > self.maxCacheIdle {
-					// debug
-					//fmt.Printf("clean idle %v(%v/%v)\n", name, ts.Sub(self.cache[name].last), self.maxCacheIdle)
-					delete(self.cache, name)
+			if self.addStack.GetCacheSize() == 0 {
+				for name, _ := range self.cache {
+					self.cacheMu.Lock()
+					if ts.Sub(self.cache[name].last) > self.maxCacheIdle {
+						// debug
+						//fmt.Printf("clean idle %v(%v/%v)\n", name, ts.Sub(self.cache[name].last), self.maxCacheIdle)
+						delete(self.cache, name)
+					}
+					self.cacheMu.Unlock()
 				}
-				self.cacheMu.Unlock()
-			}
-			//if len(self.cache) < 128 {
-			//	rd.FreeOSMemory()
-			//}
-		}
-	}
-}
-
-/*
-// verify
-func (self *PathWatcher) verify(path string) int64 {
-	//
-	var miss int64 = 0
-	//
-	folderScanner := fc.NewFolderScanner(self.watcherNum)
-	for pattern, _ := range self.watchIncRegex {
-		//fmt.Printf("add SetScanFilter: %v/%v\n", true, pattern)
-		folderScanner.SetScanFilter(true, pattern)
-	}
-	for pattern, _ := range self.watchExcRegex {
-		//fmt.Printf("add SetScanFilter: %v/%v\n", false, pattern)
-		folderScanner.SetScanFilter(false, pattern)
-	}
-	dirOut, err := folderScanner.Scan(path, fc.FOLDER_SCAN_DIR_ONLY, true)
-	//fmt.Printf("folderScanner.Scan: %v\n", err)
-	if err != nil {
-		return -1
-	}
-	defer func() {
-		//fmt.Printf("return folderScanner closing: %v\n", path)
-		folderScanner.Close()
-		//fmt.Printf("return folderScanner closed: %v\n", path)
-	}()
-	for newDir := range dirOut {
-		newInfo := newDir.(*fc.PathInfo)
-		//fmt.Printf("recursive scan out: %v\n", newInfo.Path)
-		err := newInfo.Err
-		path := newInfo.Path
-		if err != nil {
-			continue
-		}
-		hid := self.Sum64a(path)
-		if self.rWatcher.IsWatched(path) == false {
-			fmt.Printf("MISS: %d || %s\n", hid, path)
-			miss++
-			//fmt.Printf("MISS: %d || %s\n", hid, path)
-			err := self.rWatcher.Add(path)
-			if err != nil {
-				fmt.Printf("verify self.rWatcher.Add(%s): %v\n", path, err)
+				//if len(self.cache) == 0 {
+				//	rd.FreeOSMemory()
+				//}
 			}
 		}
 	}
-	return miss
 }
-*/
 
 // WatchRecursive watches a directory recursively. If a dir is created
 // within directory it is also watched.
@@ -717,8 +563,6 @@ func (self *PathWatcher) WatchRecursive(path string, ignoreScanError bool) (<-ch
 		fmt.Printf("recursively newWatchHandle failed: %v\n", err)
 		return nil, err
 	}
-	//
-	self.rootList[path] = struct{}{}
 	//
 	//fmt.Printf("recursively newWatchHandle ok: %s\n", path)
 	//
@@ -762,46 +606,16 @@ func (self *PathWatcher) Watch(path string, ignoreScanError bool) (<-chan interf
 	return self.events.Out(), err
 }
 
-//
-func (self *PathWatcher) lazyWatch(path string) int64 {
-	//
-	var addCount int64
-	dirs, _, _ := fc.ScanDir(path, fc.FOLDER_SCAN_DIR_ONLY, false)
-	// dirs will not include path
-	for key, _ := range dirs {
-		// add to rWatcher
-		if self.rWatcher.IsWatched(key) {
-			continue
-		}
-		addCount++
-		err := self.rWatcher.Add(key)
-		self.eventSend(&ActEvent{
-			Stage:    STAGE_LAZY,
-			Event:    fsnotify.NewEvent(fsnotify.Create|fsnotify.Write, key),
-			IsFolder: true,
-			UnixNano: dirs[key].ModTime().UnixNano(),
-			Inode:    dirs[key].Sys().(*syscall.Stat_t).Ino,
-			Err:      err,
-			Id:       self.Sum64a(key),
-		}, dirs[key])
-	}
-	return addCount
-}
-
 func (self *PathWatcher) addPath(stage int, path string, fi os.FileInfo, recursive bool) error {
-	var watcher *HashWatcher
+	var watcher *fsnotify.Watcher
 	if recursive || stage == STAGE_LAZY {
 		watcher = self.rWatcher
 	} else {
 		watcher = self.pWatcher
 	}
-	if watcher.IsWatched(path) {
-		return nil
-	}
 	err := watcher.Add(path)
-	//if err != nil {
-	//	//fmt.Printf("recursive %v, addPath(%s): %v\n", recursive, path, err)
-	//	return err
+	//if watcher.IsWatched(path) {
+	//	return nil
 	//}
 	self.eventSend(&ActEvent{
 		Stage:    stage,

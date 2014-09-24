@@ -53,8 +53,15 @@ func main() {
 	if *modFlag == "mkdir2" {
 		os.Exit(mkdir2())
 	}
+	if *modFlag == "mkdir3" {
+		os.Exit(mkdir3())
+	}
 	if *modFlag == "rmdir" {
 		os.Exit(rmdir())
+	}
+
+	if *modFlag == "rmdir3" {
+		os.Exit(rmdir3())
 	}
 
 	go func() {
@@ -72,7 +79,7 @@ func main() {
 	demo.SetThreshold(1e5)
 	//demo.SetThreshold(0)
 	//fmt.Printf("demo.SetThreshold(%v)\n", 5)
-	demo.SetMaxCacheIdle(8e9)
+	demo.SetMaxCacheIdle(5e9)
 	//fmt.Printf("demo.SetMaxCacheIdle(%v)\n", 8e9)
 
 	eventCh, err := demo.WatchRecursive(*pathStr, true)
@@ -143,7 +150,67 @@ func main() {
 	return
 }
 
-//
+func rmdir3() int {
+	dirmu := sync.Mutex{}
+	rootdir := "watchroot3"
+	oldpath, _ := os.Getwd()
+	wg := sync.WaitGroup{}
+	var cnt int64
+	os.Mkdir(rootdir, os.ModePerm)
+	basedir := oldpath + "/" + rootdir + "/"
+	for i := int64(0); i < 1000000; {
+		wg.Add(1)
+		go func(start int64) {
+			for j := int64(0); j < 100000; j++ {
+				dirb := basedir + strconv.Itoa(int(j+start))
+				if err := os.Remove(dirb); err != nil {
+					//fmt.Println("rmdir", dirb, err)
+					//return
+				}
+				//fmt.Println("mkdir", dirb)
+				dirmu.Lock()
+				cnt++
+				dirmu.Unlock()
+			}
+			wg.Done()
+		}(i)
+		i = i + 100000
+	}
+	wg.Wait()
+	fmt.Println("rmdir3", rootdir, cnt)
+	return 0
+}
+
+func mkdir3() int {
+	dirmu := sync.Mutex{}
+	rootdir := "watchroot3"
+	oldpath, _ := os.Getwd()
+	wg := sync.WaitGroup{}
+	var cnt int64
+	os.Mkdir(rootdir, os.ModePerm)
+	basedir := oldpath + "/" + rootdir + "/"
+	for i := int64(0); i < 1000000; {
+		wg.Add(1)
+		go func(start int64) {
+			for j := int64(0); j < 100000; j++ {
+				dirb := basedir + strconv.Itoa(int(j+start))
+				if err := os.Mkdir(dirb, os.ModePerm); err != nil {
+					fmt.Println("mkdir", dirb, err)
+					//return
+				}
+				//fmt.Println("mkdir", dirb)
+				dirmu.Lock()
+				cnt++
+				dirmu.Unlock()
+			}
+			wg.Done()
+		}(i)
+		i = i + 100000
+	}
+	wg.Wait()
+	fmt.Println("mkdir", rootdir, cnt)
+	return 0
+}
 
 func mkdir2() int {
 	dirmu := sync.Mutex{}
@@ -200,7 +267,7 @@ func mkdir() int {
 		dirmu.Unlock()
 		wg.Add(1)
 		go func(start string) {
-			for j := 0; j < 1000; j++ {
+			for j := 0; j < 100; j++ {
 				dirb := start + "/" + strconv.Itoa(j)
 				if err := os.Mkdir(dirb, os.ModePerm); err != nil {
 					fmt.Println("mkdir", dirb, err)
