@@ -1,5 +1,5 @@
 //
-// coolpipe demo
+// fswatcher demo
 //
 
 package main
@@ -56,6 +56,12 @@ func main() {
 	if *modFlag == "mkdir3" {
 		os.Exit(mkdir3())
 	}
+	if *modFlag == "mkdir4" {
+		os.Exit(mkdir4())
+	}
+	if *modFlag == "mkdir5" {
+		os.Exit(mkdir5())
+	}
 	if *modFlag == "rmdir" {
 		os.Exit(rmdir())
 	}
@@ -90,9 +96,9 @@ func main() {
 	}
 	fmt.Printf("demo.WatchRecursive(%s) waiting event %v, %v ...\n", *pathStr, eventCh, err)
 	//go func() {
-	//	time.Sleep(6e9)
-	//	fmt.Println("auto closing")
-	//	demo.Close()
+	//time.Sleep(3e9)
+	//fmt.Println("auto closing")
+	//demo.Close()
 	//}()
 	starts := time.Now()
 	var evcnt int64
@@ -108,12 +114,12 @@ func main() {
 			for {
 				//runtime.GC()
 				//rd.FreeOSMemory()
-				wc, cache, adds, removes := demo.Stat()
+				wc, cache, pending := demo.Stat()
 				ms := &runtime.MemStats{}
 				runtime.ReadMemStats(ms)
 				cur = ms.Alloc + ms.Sys
 				if pre != cur {
-					fmt.Printf("MEM Used %d/Res %d,  watching %d, cache %d, ADDstack %d, RMstack %d, event %d(scan %d), error %d, timing %v\n", ms.Alloc/1024/1024, ms.Sys/1024/1024, wc, cache, adds, removes, evcnt, scancnt, everr, ts.Sub(starts))
+					fmt.Printf("MEM Used %d/Res %d,  watching %d, cache %d, pending %d, event %d(scan %d), error %d, timing %v\n", ms.Alloc/1024/1024, ms.Sys/1024/1024, wc, cache, pending, evcnt, scancnt, everr, ts.Sub(starts))
 					pre = cur
 				}
 				ts = <-tk.C
@@ -277,6 +283,97 @@ func mkdir() int {
 				dirmu.Lock()
 				cnt++
 				dirmu.Unlock()
+			}
+			wg.Done()
+		}(dira)
+	}
+	wg.Wait()
+	fmt.Println("mkdir", rootdir, cnt)
+	return 0
+}
+
+func mkdir4() int {
+	dirmu := sync.Mutex{}
+	rootdir := "watchroot"
+	oldpath, _ := os.Getwd()
+	wg := sync.WaitGroup{}
+	var cnt int64
+	os.Mkdir(rootdir, os.ModePerm)
+	for i := 0; i < 1000; i++ {
+		dira := oldpath + "/" + rootdir + "/" + strconv.Itoa(i)
+		if err := os.Mkdir(dira, os.ModePerm); err != nil {
+			fmt.Println("mkdir", dira, err)
+			return 1
+		}
+		dirmu.Lock()
+		cnt++
+		dirmu.Unlock()
+		wg.Add(1)
+		go func(start string) {
+			for j := 0; j < 1000; j++ {
+				dirb := start + "/" + strconv.Itoa(j)
+				if err := os.Mkdir(dirb, os.ModePerm); err != nil {
+					fmt.Println("mkdir", dirb, err)
+					return
+				}
+				//fmt.Println("mkdir", dirb)
+				dirmu.Lock()
+				cnt++
+				dirmu.Unlock()
+			}
+			wg.Done()
+		}(dira)
+	}
+	wg.Wait()
+	fmt.Println("mkdir", rootdir, cnt)
+	return 0
+}
+
+func mkdir5() int {
+	dirmu := sync.Mutex{}
+	rootdir := "watchroot"
+	oldpath, _ := os.Getwd()
+	wg := sync.WaitGroup{}
+	var cnt int64
+	os.Mkdir(rootdir, os.ModePerm)
+	for i := 0; i < 100; i++ {
+		dira := oldpath + "/" + rootdir + "/" + strconv.Itoa(i)
+		if err := os.Mkdir(dira, os.ModePerm); err != nil {
+			//fmt.Println("mkdir", dira, err)
+			//return 1
+		}
+		dirmu.Lock()
+		cnt++
+		dirmu.Unlock()
+		wg.Add(1)
+		go func(start string) {
+			for j := 0; j < 100; j++ {
+				dirb := start + "/" + strconv.Itoa(j)
+				if err := os.Mkdir(dirb, os.ModePerm); err != nil {
+					//fmt.Println("mkdir", dirb, err)
+					//return
+					//continue
+				}
+				//fmt.Println("mkdir", dirb)
+				dirmu.Lock()
+				cnt++
+				dirmu.Unlock()
+				wg.Add(1)
+				go func(start string) {
+					for j := 0; j < 100; j++ {
+						dirb := start + "/" + strconv.Itoa(j)
+						if err := os.Mkdir(dirb, os.ModePerm); err != nil {
+							//fmt.Println("mkdir", dirb, err)
+							//return
+							//continue
+						}
+						//fmt.Println("mkdir", dirb)
+						dirmu.Lock()
+						cnt++
+						dirmu.Unlock()
+					}
+					wg.Done()
+				}(dirb)
 			}
 			wg.Done()
 		}(dira)
